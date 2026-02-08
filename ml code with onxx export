@@ -1,21 +1,23 @@
 # ============================================================================
-# SEMICONDUCTOR WAFER DEFECT CLASSIFICATION - WITH ONNX EXPORT (FIXED)
+# SEMICONDUCTOR WAFER DEFECT CLASSIFICATION
 # ============================================================================
 
-# CELL 1: Install Dependencies (UPDATED with onnxscript)
 print("Installing dependencies...")
-!pip install -q torch torchvision onnx onnxruntime onnxscript scikit-learn seaborn tqdm
+!pip install -q torch torchvision onnx onnxruntime onnxscript scikit-learn seaborn tqdm ipywidgets
 from IPython.display import clear_output
 clear_output()
-print("All dependencies installed successfully!")
+print("✅ All dependencies installed!")
 
-# CELL 2: Imports
-import os, random, time, shutil, zipfile, warnings
+# ======================================
+# IMPORTS
+# ======================================
+import os, random, time, shutil, zipfile, warnings, io
 from pathlib import Path
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
 import seaborn as sns
+from ipywidgets import widgets
 
 import torch
 import torch.nn as nn
@@ -25,7 +27,6 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import torchvision.transforms as T
 from torchvision import models
-import onnx
 
 from sklearn.metrics import accuracy_score, confusion_matrix
 from tqdm.auto import tqdm
@@ -43,16 +44,18 @@ def set_seed(seed=42):
 
 set_seed(42)
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Device: {DEVICE}")
+print(f"✅ Running on device: {DEVICE}")
 
-# CELL 3: Config
-EPOCHS = 15 
+# ======================================
+# CONFIG
+# ======================================
+EPOCHS = 15
 BATCH_SIZE = 32
 LEARNING_RATE = 0.001
 IMAGE_SIZE = 224
 MEAN = [0.485, 0.456, 0.406]
 STD = [0.229, 0.224, 0.225]
-NUM_WORKERS = 0 
+NUM_WORKERS = 0
 
 DATASET_DIR = "/content/dataset"
 CHECKPOINT_DIR = "/content/checkpoints"
@@ -63,8 +66,11 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 CLASS_NAMES = []
 NUM_CLASSES = 0
 
-# CELL 4: Upload Dataset
+# ======================================
+# DATASET UPLOAD
+# ======================================
 def create_val_split(ratio=0.2):
+    print(f"Creating validation split ({ratio*100:.0f}%)...")
     train_dir = os.path.join(DATASET_DIR, 'train')
     val_dir = os.path.join(DATASET_DIR, 'val')
     os.makedirs(val_dir, exist_ok=True)
@@ -74,22 +80,49 @@ def create_val_split(ratio=0.2):
         dst = os.path.join(val_dir, cls)
         os.makedirs(dst, exist_ok=True)
         imgs = [f for f in os.listdir(src) if f.lower().endswith(('.jpg','.jpeg','.png','.bmp'))]
-        if len(imgs) < 2: continue
+        n = max(2, int(len(imgs)*ratio))
+        random.shuffle(imgs)
+        for img in imgs[:n]:
+            shutil.move(os.path.join(src, img), os.path.join(dst, img))
+        print(f"  {cls}: {n} → val")
+
+def create_test_split(ratio=0.1):
+    print(f"Creating test split ({ratio*100:.0f}%)...")
+    train_dir = os.path.join(DATASET_DIR, 'train')
+    test_dir = os.path.join(DATASET_DIR, 'test')
+    os.makedirs(test_dir, exist_ok=True)
+    for cls in os.listdir(train_dir):
+        src = os.path.join(train_dir, cls)
+        if not os.path.isdir(src): continue
+        dst = os.path.join(test_dir, cls)
+        os.makedirs(dst, exist_ok=True)
+        imgs = [f for f in os.listdir(src) if f.lower().endswith(('.jpg','.jpeg','.png','.bmp'))]
         n = max(1, int(len(imgs)*ratio))
         random.shuffle(imgs)
         for img in imgs[:n]:
             shutil.move(os.path.join(src, img), os.path.join(dst, img))
+        print(f"  {cls}: {n} → test")
 
 def upload_dataset():
-    print("Upload your dataset ZIP (containing a 'train' folder with class subfolders)")
+    print("\n" + "="*60)
+    print("⬆️ UPLOAD YOUR DATASET ZIP")
+    print("="*60)
+    print("Zip should contain a 'train' folder with class subfolders inside")
+    
     uploaded = files.upload()
-    if not uploaded: return False
+    if not uploaded:
+        print("No file uploaded!")
+        return False
     
     zip_file = list(uploaded.keys())[0]
-    if os.path.exists(DATASET_DIR): shutil.rmtree(DATASET_DIR)
+    print(f"Uploaded: {zip_file}")
+    
+    if os.path.exists(DATASET_DIR):
+        shutil.rmtree(DATASET_DIR)
     
     with zipfile.ZipFile(zip_file, 'r') as z:
         z.extractall("/content/temp")
+    os.remove(zip_file)
     
     train_path = None
     for root, dirs, _ in os.walk("/content/temp"):
@@ -98,28 +131,49 @@ def upload_dataset():
             break
     
     if not train_path:
-        print("ERROR: 'train' folder not found!")
+        print("❌ ERROR: 'train' folder not found in ZIP!")
+        shutil.rmtree("/content/temp")
         return False
     
     os.makedirs(DATASET_DIR, exist_ok=True)
     shutil.move(train_path, os.path.join(DATASET_DIR, "train"))
+    shutil.rmtree("/content/temp")
     
     global CLASS_NAMES, NUM_CLASSES
-    CLASS_NAMES = sorted([d for d in os.listdir(os.path.join(DATASET_DIR, "train")) if os.path.isdir(os.path.join(DATASET_DIR, "train", d))])
+    CLASS_NAMES = sorted([d for d in os.listdir(os.path.join(DATASET_DIR, "train"))
+                         if os.path.isdir(os.path.join(DATASET_DIR, "train", d))])
     NUM_CLASSES = len(CLASS_NAMES)
     
+    print(f"\n✅ Detected {NUM_CLASSES} classes: {CLASS_NAMES}")
+    
     create_val_split()
-    print(f"Dataset ready! Classes: {CLASS_NAMES}")
+    create_test_split()
     return True
 
 upload_dataset()
 
-# CELL 5: Data Pipeline
+# ======================================
+# DATALOADERS
+# ======================================
 class GrayToRGB:
-    def __call__(self, img): return img.convert('RGB')
+    def __call__(self, img):
+        return img.convert('RGB')
 
-train_tf = T.Compose([GrayToRGB(), T.Resize((IMAGE_SIZE, IMAGE_SIZE)), T.RandomHorizontalFlip(), T.ToTensor(), T.Normalize(MEAN, STD)])
-val_tf = T.Compose([GrayToRGB(), T.Resize((IMAGE_SIZE, IMAGE_SIZE)), T.ToTensor(), T.Normalize(MEAN, STD)])
+train_tf = T.Compose([
+    GrayToRGB(),
+    T.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+    T.RandomHorizontalFlip(),
+    T.RandomRotation(15),
+    T.ToTensor(),
+    T.Normalize(MEAN, STD)
+])
+
+val_tf = T.Compose([
+    GrayToRGB(),
+    T.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+    T.ToTensor(),
+    T.Normalize(MEAN, STD)
+])
 
 class WaferDataset(Dataset):
     def __init__(self, root, transform=None):
@@ -132,107 +186,191 @@ class WaferDataset(Dataset):
                 for f in cls_path.iterdir():
                     if f.suffix.lower() in {'.jpg','.jpeg','.png','.bmp'}:
                         self.samples.append((str(f), CLASS_NAMES.index(cls)))
+    
     def __len__(self): return len(self.samples)
+    
     def __getitem__(self, idx):
         path, label = self.samples[idx]
         img = Image.open(path)
-        if self.transform: img = self.transform(img)
+        if self.transform:
+            img = self.transform(img)
         return img, label
 
 train_ds = WaferDataset(os.path.join(DATASET_DIR, "train"), train_tf)
 val_ds = WaferDataset(os.path.join(DATASET_DIR, "val"), val_tf)
-train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE)
+test_ds = WaferDataset(os.path.join(DATASET_DIR, "test"), val_tf)
 
-# CELL 6: Model Setup
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True, drop_last=True)
+val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+
+print(f"\n✅ Dataset loaded: Train:{len(train_ds)} | Val:{len(val_ds)} | Test:{len(test_ds)}")
+
+# ======================================
+# MODEL
+# ======================================
 model = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.IMAGENET1K_V1)
-model.classifier[1] = nn.Linear(model.last_channel, NUM_CLASSES)
+in_features = model.classifier[1].in_features
+model.classifier = nn.Sequential(
+    nn.Dropout(0.25),
+    nn.Linear(in_features, 256),
+    nn.ReLU(),
+    nn.Linear(256, NUM_CLASSES)
+)
 model = model.to(DEVICE)
 
-# CELL 7: Training
+# ======================================
+# TRAINING
+# ======================================
 criterion = nn.CrossEntropyLoss()
-optimizer = AdamW(model.parameters(), lr=LEARNING_RATE)
+optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
 scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS)
+scaler = torch.cuda.amp.GradScaler(enabled=DEVICE.type=='cuda')
 
-best_acc = 0
+best_acc = 0.0
+print("\n🚀 STARTING TRAINING")
+print("="*60)
+
 for epoch in range(EPOCHS):
     model.train()
-    for imgs, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}"):
+    train_loss = 0
+    correct = 0
+    total = 0
+    
+    pbar = tqdm(train_loader, leave=False)
+    for imgs, labels in pbar:
         imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+        
         optimizer.zero_grad()
-        outputs = model(imgs)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
+        with torch.cuda.amp.autocast(enabled=DEVICE.type=='cuda'):
+            outputs = model(imgs)
+            loss = criterion(outputs, labels)
+        
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        
+        train_loss += loss.item()
+        _, predicted = outputs.max(1)
+        total += labels.size(0)
+        correct += predicted.eq(labels).sum().item()
+        pbar.set_description(f"Epoch {epoch+1}/{EPOCHS}")
+    
+    scheduler.step()
     
     model.eval()
-    correct, total = 0, 0
+    val_correct = 0
+    val_total = 0
     with torch.no_grad():
         for imgs, labels in val_loader:
             imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
             outputs = model(imgs)
-            correct += (outputs.argmax(1) == labels).sum().item()
-            total += labels.size(0)
+            _, predicted = outputs.max(1)
+            val_total += labels.size(0)
+            val_correct += predicted.eq(labels).sum().item()
     
-    acc = 100 * correct / (total + 1e-6)
-    scheduler.step()
-    print(f"Val Accuracy: {acc:.2f}%")
-    if acc > best_acc:
-        best_acc = acc
+    val_acc = 100. * val_correct / val_total
+    train_acc = 100. * correct / total
+    
+    if val_acc > best_acc:
+        best_acc = val_acc
         torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, "best.pt"))
-
-# CELL 8 & 9: Testing omitted for brevity (same as your logic)
-
-# ============================================================================
-# CELL 10: EXPORT TO ONNX (FIXED)
-# ============================================================================
-def export_to_onnx():
-    print("\n" + "="*40)
-    print("EXPORTING MODEL TO ONNX")
-    print("="*40)
-    
-    # Load weights
-    checkpoint_path = os.path.join(CHECKPOINT_DIR, "best.pt")
-    if not os.path.exists(checkpoint_path):
-        print("Error: No checkpoint found to export!")
-        return
-
-    model.load_state_dict(torch.load(checkpoint_path))
-    model.to('cpu') 
-    model.eval()
-
-    # Create dummy input
-    dummy_input = torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE)
-    onnx_file_path = os.path.join(RESULTS_DIR, "wafer_defect_model.onnx")
-
-    # Export using the Torch-to-ONNX Legacy pathway (widely compatible)
-    # We specify opset_version=12 or 13 for better compatibility
-    torch.onnx.export(
-        model,
-        dummy_input,
-        onnx_file_path,
-        export_params=True,
-        opset_version=13,
-        do_constant_folding=True,
-        input_names=['input'],
-        output_names=['output'],
-        dynamic_axes={
-            'input': {0: 'batch_size'},
-            'output': {0: 'batch_size'}
-        }
-    )
-
-    if os.path.exists(onnx_file_path):
-        print(f"SUCCESS: Model saved to {onnx_file_path}")
-        
-        # Verify
-        check_model = onnx.load(onnx_file_path)
-        onnx.checker.check_model(check_model)
-        print("ONNX verification passed!")
-        
-        # Download
-        files.download(onnx_file_path)
+        print(f"Epoch {epoch+1:2d} | Train: {train_acc:.1f}% | Val: {val_acc:.1f}% ✅ NEW BEST")
     else:
-        print("Export failed.")
+        print(f"Epoch {epoch+1:2d} | Train: {train_acc:.1f}% | Val: {val_acc:.1f}%")
 
-export_to_onnx()
+print(f"\n🏁 TRAINING FINISHED! Best accuracy: {best_acc:.1f}%")
+
+# ======================================
+# TEST EVALUATION
+# ======================================
+model.load_state_dict(torch.load(os.path.join(CHECKPOINT_DIR, "best.pt")))
+model.eval()
+
+all_preds = []
+all_labels = []
+with torch.no_grad():
+    for imgs, labels in test_loader:
+        imgs = imgs.to(DEVICE)
+        outputs = model(imgs)
+        preds = outputs.argmax(1).cpu().numpy()
+        all_preds.extend(preds)
+        all_labels.extend(labels.numpy())
+
+test_acc = accuracy_score(all_labels, all_preds) * 100
+print(f"\n🧪 FINAL TEST ACCURACY: {test_acc:.1f}%")
+
+plt.figure(figsize=(10,8))
+cm = confusion_matrix(all_labels, all_preds)
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES)
+plt.title('Confusion Matrix')
+plt.ylabel('True Label')
+plt.xlabel('Predicted Label')
+plt.tight_layout()
+plt.show()
+
+# ======================================
+# ONNX EXPORT
+# ======================================
+print("\n📤 EXPORTING ONNX MODEL")
+import onnx
+import onnxruntime as ort
+
+ONNX_FILE_PATH = os.path.join(RESULTS_DIR, "wafer_defect_model.onnx")
+dummy_input = torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE).to(DEVICE)
+
+torch.onnx.export(
+    model,
+    dummy_input,
+    ONNX_FILE_PATH,
+    export_params=True,
+    opset_version=18,
+    do_constant_folding=True,
+    input_names = ['input'],
+    output_names = ['output'],
+    dynamic_axes={'input' : {0 : 'batch_size'}, 'output' : {0 : 'batch_size'}},
+    training=torch.onnx.TrainingMode.EVAL
+)
+
+onnx.checker.check_model(onnx.load(ONNX_FILE_PATH))
+print(f"✅ ONNX model exported successfully!")
+print(f"✅ Class order: {CLASS_NAMES}")
+
+files.download(ONNX_FILE_PATH)
+
+# ======================================
+# PERMANENT TEST TOOL
+# ======================================
+print("\n🧪 PERMANENT TEST TOOL READY!")
+print("Upload any image to test anytime:")
+
+upload_btn = widgets.FileUpload(
+    accept='.png,.jpg,.jpeg,.bmp',
+    multiple=False,
+    description='Test Image',
+    button_style='success'
+)
+display(upload_btn)
+
+def on_upload_change(change):
+    if not upload_btn.value: return
+    data = list(upload_btn.value.values())[0]['content']
+    img = Image.open(io.BytesIO(data)).convert('RGB')
+    
+    img_tensor = val_tf(img).unsqueeze(0).to(DEVICE)
+    with torch.no_grad():
+        output = model(img_tensor)
+        prob = F.softmax(output, dim=1)
+        pred_idx = output.argmax(1).item()
+        confidence = prob[0][pred_idx].item() * 100
+    
+    plt.figure(figsize=(7,7))
+    plt.imshow(img)
+    plt.title(f"Prediction: {CLASS_NAMES[pred_idx]}\nConfidence: {confidence:.1f}%", fontsize=16, color='#2ecc71')
+    plt.axis('off')
+    plt.show()
+    
+    upload_btn.value.clear()
+    upload_btn._counter = 0
+
+upload_btn.observe(on_upload_change, names='value')
