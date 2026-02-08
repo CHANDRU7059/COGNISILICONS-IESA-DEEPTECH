@@ -1,0 +1,330 @@
+# ============================================================================
+# SEMICONDUCTOR WAFER DEFECT CLASSIFICATION - FULLY WORKING COLAB VERSION
+# ============================================================================
+
+# CELL 1: Install Dependencies
+print("Installing dependencies...")
+!pip install -q torch torchvision onnx onnxruntime scikit-learn seaborn tqdm
+from IPython.display import clear_output
+clear_output()
+print("All dependencies installed!")
+
+# CELL 2: Imports
+import os, random, time, shutil, zipfile, warnings
+from pathlib import Path
+import numpy as np
+from PIL import Image
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+import torchvision.transforms as T
+from torchvision import models
+
+from sklearn.metrics import accuracy_score, confusion_matrix
+from tqdm.auto import tqdm
+from google.colab import files
+
+warnings.filterwarnings('ignore')
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed(42)
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Device: {DEVICE}")
+
+# CELL 3: Config
+EPOCHS = 20
+BATCH_SIZE = 32
+LEARNING_RATE = 0.001
+IMAGE_SIZE = 224
+MEAN = [0.485, 0.456, 0.406]
+STD = [0.229, 0.224, 0.225]
+NUM_WORKERS = 0  # Critical for Colab!
+
+DATASET_DIR = "/content/dataset"
+CHECKPOINT_DIR = "/content/checkpoints"
+RESULTS_DIR = "/content/results"
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+CLASS_NAMES = []
+NUM_CLASSES = 0
+
+# CELL 4: Upload Dataset (Auto-split & Auto-detect classes)
+def create_val_split(ratio=0.2):
+    print(f"Creating validation split ({ratio*100:.0f}%)...")
+    train_dir = os.path.join(DATASET_DIR, 'train')
+    val_dir = os.path.join(DATASET_DIR, 'val')
+    os.makedirs(val_dir, exist_ok=True)
+    for cls in os.listdir(train_dir):
+        src = os.path.join(train_dir, cls)
+        if not os.path.isdir(src): continue
+        dst = os.path.join(val_dir, cls)
+        os.makedirs(dst, exist_ok=True)
+        imgs = [f for f in os.listdir(src) if f.lower().endswith(('.jpg','.jpeg','.png','.bmp'))]
+        n = max(2, int(len(imgs)*ratio))
+        random.shuffle(imgs)
+        for img in imgs[:n]:
+            shutil.move(os.path.join(src, img), os.path.join(dst, img))
+        print(f"  {cls}: {n} → val")
+
+def create_test_split(ratio=0.1):
+    print(f"Creating test split ({ratio*100:.0f}%)...")
+    train_dir = os.path.join(DATASET_DIR, 'train')
+    test_dir = os.path.join(DATASET_DIR, 'test')
+    os.makedirs(test_dir, exist_ok=True)
+    for cls in os.listdir(train_dir):
+        src = os.path.join(train_dir, cls)
+        if not os.path.isdir(src): continue
+        dst = os.path.join(test_dir, cls)
+        os.makedirs(dst, exist_ok=True)
+        imgs = [f for f in os.listdir(src) if f.lower().endswith(('.jpg','.jpeg','.png','.bmp'))]
+        n = max(1, int(len(imgs)*ratio))
+        random.shuffle(imgs)
+        for img in imgs[:n]:
+            shutil.move(os.path.join(src, img), os.path.join(dst, img))
+        print(f"  {cls}: {n} → test")
+
+def upload_dataset():
+    print("="*60)
+    print("UPLOAD YOUR DATASET ZIP")
+    print("="*60)
+    print("Just ZIP the 'train' folder with your class subfolders inside.")
+    print("Example: mydata.zip → train/ → bridge/, crack/, etc.")
+    print("\nUpload now:")
+    
+    uploaded = files.upload()
+    if not uploaded:
+        print("No file uploaded!")
+        return False
+    
+    zip_file = list(uploaded.keys())[0]
+    print(f"Uploaded: {zip_file}")
+    
+    if os.path.exists(DATASET_DIR):
+        shutil.rmtree(DATASET_DIR)
+    
+    # Extract
+    with zipfile.ZipFile(zip_file, 'r') as z:
+        z.extractall("/content/temp")
+    os.remove(zip_file)
+    
+    # Find train folder
+    train_path = None
+    for root, dirs, _ in os.walk("/content/temp"):
+        if "train" in dirs:
+            train_path = os.path.join(root, "train")
+            break
+    
+    if not train_path:
+        print("ERROR: 'train' folder not found in ZIP!")
+        shutil.rmtree("/content/temp")
+        return False
+    
+    os.makedirs(DATASET_DIR, exist_ok=True)
+    shutil.move(train_path, os.path.join(DATASET_DIR, "train"))
+    shutil.rmtree("/content/temp")
+    
+    global CLASS_NAMES, NUM_CLASSES
+    CLASS_NAMES = sorted([d for d in os.listdir(os.path.join(DATASET_DIR, "train"))
+                         if os.path.isdir(os.path.join(DATASET_DIR, "train", d))])
+    NUM_CLASSES = len(CLASS_NAMES)
+    
+    print(f"Detected classes ({NUM_CLASSES}): {CLASS_NAMES}")
+    
+    create_val_split()
+    create_test_split()
+    
+    print("\nDATASET READY!")
+    print("="*60)
+    return True
+
+upload_dataset()
+
+# CELL 5: Dataset & Dataloader
+class GrayToRGB:
+    def __call__(self, img):
+        return img.convert('RGB')
+
+train_tf = T.Compose([
+    GrayToRGB(),
+    T.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+    T.RandomHorizontalFlip(),
+    T.RandomRotation(15),
+    T.ToTensor(),
+    T.Normalize(MEAN, STD)
+])
+
+val_tf = T.Compose([
+    GrayToRGB(),
+    T.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+    T.ToTensor(),
+    T.Normalize(MEAN, STD)
+])
+
+class WaferDataset(Dataset):
+    def __init__(self, root, transform=None):
+        self.root = Path(root)
+        self.transform = transform
+        self.samples = []
+        for cls in CLASS_NAMES:
+            cls_path = self.root / cls
+            if cls_path.exists():
+                for f in cls_path.iterdir():
+                    if f.suffix.lower() in {'.jpg','.jpeg','.png','.bmp'}:
+                        self.samples.append((str(f), CLASS_NAMES.index(cls)))
+    
+    def __len__(self): return len(self.samples)
+    
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+        try:
+            img = Image.open(path)
+            if self.transform:
+                img = self.transform(img)
+            return img, label
+        except:
+            return torch.zeros(3, IMAGE_SIZE, IMAGE_SIZE), label
+
+train_ds = WaferDataset(os.path.join(DATASET_DIR, "train"), train_tf)
+val_ds = WaferDataset(os.path.join(DATASET_DIR, "val"), val_tf)
+test_ds = WaferDataset(os.path.join(DATASET_DIR, "test"), val_tf)
+
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, 
+                          num_workers=NUM_WORKERS, pin_memory=True, drop_last=True)
+val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, 
+                        num_workers=NUM_WORKERS, pin_memory=True)
+test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, 
+                         num_workers=NUM_WORKERS, pin_memory=True)
+
+print(f"Train: {len(train_ds)} | Val: {len(val_ds)} | Test: {len(test_ds)}")
+
+# CELL 6: Model
+model = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.IMAGENET1K_V1)
+in_features = model.classifier[1].in_features
+model.classifier = nn.Sequential(
+    nn.Dropout(0.2),
+    nn.Linear(in_features, 256),
+    nn.ReLU(),
+    nn.Linear(256, NUM_CLASSES)
+)
+model = model.to(DEVICE)
+print(f"Model ready → {NUM_CLASSES} classes")
+
+# CELL 7: Training
+criterion = nn.CrossEntropyLoss()
+optimizer = AdamW(model.parameters(), lr=LEARNING_RATE)
+scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS)
+scaler = torch.cuda.amp.GradScaler(enabled=DEVICE.type=='cuda')
+
+best_acc = 0.0
+print("\nSTARTING TRAINING")
+print("="*60)
+
+for epoch in range(EPOCHS):
+    model.train()
+    train_loss = 0
+    correct = 0
+    total = 0
+    
+    for imgs, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}", leave=False):
+        imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+        
+        optimizer.zero_grad()
+        with torch.cuda.amp.autocast(enabled=DEVICE.type=='cuda'):
+            outputs = model(imgs)
+            loss = criterion(outputs, labels)
+        
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        
+        train_loss += loss.item()
+        _, predicted = outputs.max(1)
+        total += labels.size(0)
+        correct += predicted.eq(labels).sum().item()
+    
+    scheduler.step()
+    
+    # Validation
+    model.eval()
+    val_correct = 0
+    val_total = 0
+    with torch.no_grad():
+        for imgs, labels in val_loader:
+            imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+            outputs = model(imgs)
+            _, predicted = outputs.max(1)
+            val_total += labels.size(0)
+            val_correct += predicted.eq(labels).sum().item()
+    
+    val_acc = 100. * val_correct / val_total
+    if val_acc > best_acc:
+        best_acc = val_acc
+        torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, "best.pt"))
+        print(f"Epoch {epoch+1:2d} | Train Acc: {100.*correct/total:.2f}% | Val Acc: {val_acc:.2f}% | NEW BEST!")
+    else:
+        print(f"Epoch {epoch+1:2d} | Train Acc: {100.*correct/total:.2f}% | Val Acc: {val_acc:.2f}%")
+
+print(f"\nTRAINING FINISHED! Best Val Accuracy: {best_acc:.2f}%")
+
+# CELL 8: Test & Confusion Matrix
+model.eval()
+all_preds = []
+all_labels = []
+with torch.no_grad():
+    for imgs, labels in tqdm(test_loader, desc="Testing"):
+        imgs = imgs.to(DEVICE)
+        outputs = model(imgs)
+        preds = outputs.argmax(1).cpu().numpy()
+        all_preds.extend(preds)
+        all_labels.extend(labels.numpy())
+
+acc = accuracy_score(all_labels, all_preds) * 100
+print(f"\nTEST ACCURACY: {acc:.2f}%")
+
+plt.figure(figsize=(10,8))
+cm = confusion_matrix(all_labels, all_preds)
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+            xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES)
+plt.title('Confusion Matrix')
+plt.ylabel('True')
+plt.xlabel('Predicted')
+plt.tight_layout()
+plt.show()
+
+# CELL 9: Test Your Own Image
+print("\nTEST YOUR IMAGE")
+uploaded = files.upload()
+for fn in uploaded.keys():
+    img = Image.open(fn).convert('RGB')
+    img_tensor = val_tf(img).unsqueeze(0).to(DEVICE)
+    
+    with torch.no_grad():
+        output = model(img_tensor)
+        prob = F.softmax(output, dim=1)
+        pred_idx = output.argmax(1).item()
+        confidence = prob[0][pred_idx].item() * 100
+    
+    plt.figure(figsize=(8,6))
+    plt.imshow(img)
+    plt.title(f"Prediction: {CLASS_NAMES[pred_idx]}\nConfidence: {confidence:.2f}%", 
+              fontsize=16, color='green')
+    plt.axis('off')
+    plt.show()
+
+# CELL 10: Download Model
+print("\nDOWNLOAD BEST MODEL")
+files.download("/content/checkpoints/best.pt")
