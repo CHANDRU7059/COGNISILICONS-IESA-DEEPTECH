@@ -1,5 +1,8 @@
 # sem-wefer
 This is a professional **README.md** tailored for your GitHub repository. It includes project details, setup instructions, and deployment information.
+# dataset link 
+https://drive.google.com/file/d/1P7dm6TP0T9_0jyYLPFwsAa1FQcpwppXS/view?usp=drivesdk
+
 
 ***
 
