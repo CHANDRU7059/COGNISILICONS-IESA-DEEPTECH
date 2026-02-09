@@ -71,8 +71,3 @@ The exported `wafer_defect_model.onnx` uses the following input specifications:
 ## 🤝 Contributing
 Feel free to fork this project, open issues, or submit pull requests to improve the classification accuracy or add support for new architectures.
 
-## 📄 License
-This project is licensed under the MIT License - see the LICENSE file for details.
-
----
-*Developed for Semiconductor Quality Control and Industrial Automation.*
